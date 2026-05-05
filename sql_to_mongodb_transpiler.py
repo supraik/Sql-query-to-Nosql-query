@@ -152,6 +152,46 @@ class QueryParser:
         
         raise InvalidQueryException("No table found in FROM clause.")
     
+    def extract_insert_table(self) -> str:
+        """Extract table name from INSERT INTO clause."""
+        sql_upper = self.sql.upper()
+        insert_idx = sql_upper.find("INSERT INTO")
+        if insert_idx == -1:
+            raise InvalidQueryException("INSERT INTO keyword not found.")
+        
+        # Extract table name after INSERT INTO
+        start = insert_idx + len("INSERT INTO")
+        remaining = self.sql[start:].strip()
+        
+        # Table name is the first word/identifier
+        table_name = remaining.split()[0].strip()
+        if not table_name:
+            raise InvalidQueryException("No table name found after INSERT INTO.")
+        
+        return table_name
+    
+    def extract_update_table(self) -> str:
+        """Extract table name from UPDATE clause."""
+        sql_upper = self.sql.upper()
+        update_idx = sql_upper.find("UPDATE")
+        if update_idx == -1:
+            raise InvalidQueryException("UPDATE keyword not found.")
+        
+        # Extract table name after UPDATE
+        start = update_idx + len("UPDATE")
+        remaining = self.sql[start:].strip()
+        
+        # Table name is the first word/identifier before SET
+        set_idx = remaining.upper().find("SET")
+        if set_idx == -1:
+            raise InvalidQueryException("SET keyword not found in UPDATE statement.")
+        
+        table_name = remaining[:set_idx].strip()
+        if not table_name:
+            raise InvalidQueryException("No table name found after UPDATE.")
+        
+        return table_name
+    
     def extract_where_clause(self) -> Optional[str]:
         """Extract WHERE clause content."""
         for token in self.tokens:
@@ -253,6 +293,123 @@ class QueryParser:
             }
         except Exception as e:
             raise UnsupportedSQLException(f"Failed to parse JOIN clause: {str(e)}")
+    
+    def extract_insert_values(self) -> Tuple[List[str], List[Any]]:
+        """Extract columns and values from INSERT statement."""
+        sql_upper = self.sql.upper()
+        
+        # Find INSERT INTO table (columns) VALUES (values)
+        values_idx = sql_upper.find("VALUES")
+        if values_idx == -1:
+            raise InvalidQueryException("INSERT statement requires VALUES clause")
+        
+        # Extract columns
+        columns_start = sql_upper.find("(", sql_upper.find("INSERT"))
+        columns_end = sql_upper.find(")", columns_start)
+        if columns_start == -1 or columns_end == -1:
+            raise InvalidQueryException("INSERT statement requires column list")
+        
+        columns_str = self.sql[columns_start + 1:columns_end]
+        columns = [col.strip() for col in columns_str.split(",")]
+        
+        # Extract values
+        values_start = self.sql.upper().find("(", values_idx)
+        values_end = self.sql.rfind(")")
+        if values_start == -1:
+            raise InvalidQueryException("INSERT statement requires values")
+        
+        values_str = self.sql[values_start + 1:values_end]
+        values = self._parse_values(values_str)
+        
+        if len(columns) != len(values):
+            raise InvalidQueryException(f"Column count ({len(columns)}) does not match value count ({len(values)})")
+        
+        return columns, values
+    
+    def extract_update_values(self) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Extract SET clause and WHERE clause from UPDATE statement."""
+        sql_upper = self.sql.upper()
+        
+        # Find SET clause
+        set_idx = sql_upper.find("SET")
+        if set_idx == -1:
+            raise InvalidQueryException("UPDATE statement requires SET clause")
+        
+        # Find WHERE clause (optional)
+        where_idx = sql_upper.find("WHERE")
+        
+        # Extract SET assignments
+        if where_idx != -1:
+            set_content = self.sql[set_idx + 3:where_idx].strip()
+        else:
+            set_content = self.sql[set_idx + 3:].strip()
+        
+        # Parse assignments (col=value, col=value, ...)
+        assignments = {}
+        for assignment in set_content.split(","):
+            assignment = assignment.strip()
+            if "=" not in assignment:
+                raise InvalidQueryException(f"Invalid SET assignment: {assignment}")
+            
+            col, val = assignment.split("=", 1)
+            col = col.strip()
+            val = val.strip()
+            
+            # Convert value type
+            assignments[col] = self._convert_value(val)
+        
+        # Extract WHERE clause if exists
+        where_clause = None
+        if where_idx != -1:
+            where_clause = self.sql[where_idx + 5:].strip()
+        
+        return assignments, where_clause
+    
+    def _parse_values(self, values_str: str) -> List[Any]:
+        """Parse comma-separated values."""
+        values = []
+        current_val = ""
+        in_quotes = False
+        quote_char = None
+        
+        for char in values_str:
+            if char in ("'", '"') and not in_quotes:
+                in_quotes = True
+                quote_char = char
+            elif char == quote_char and in_quotes:
+                in_quotes = False
+            elif char == "," and not in_quotes:
+                values.append(self._convert_value(current_val.strip()))
+                current_val = ""
+                continue
+            
+            current_val += char
+        
+        if current_val.strip():
+            values.append(self._convert_value(current_val.strip()))
+        
+        return values
+    
+    def _convert_value(self, val: str) -> Any:
+        """Convert string value to appropriate type."""
+        val = val.strip()
+        
+        # Remove quotes
+        if (val.startswith("'") and val.endswith("'")) or (val.startswith('"') and val.endswith('"')):
+            return val[1:-1]
+        
+        # Try numeric conversion
+        if val.isdigit():
+            return int(val)
+        
+        if val.replace(".", "", 1).isdigit():
+            return float(val)
+        
+        # Try boolean
+        if val.upper() in ("TRUE", "FALSE"):
+            return val.upper() == "TRUE"
+        
+        return val
 
 
 # =====================================================================
@@ -294,7 +451,16 @@ class WhereClauseParser:
             and_result = {}
             for part in and_parts:
                 parsed = self._parse_condition(part.strip())
-                and_result.update(parsed)
+                # Merge conditions properly - if same field exists, merge operators
+                for field, condition_dict in parsed.items():
+                    if field in and_result:
+                        # Same field - merge operators
+                        if isinstance(and_result[field], dict) and isinstance(condition_dict, dict):
+                            and_result[field].update(condition_dict)
+                        else:
+                            and_result[field] = condition_dict
+                    else:
+                        and_result[field] = condition_dict
             return and_result
         
         # Parse simple comparison
@@ -605,15 +771,48 @@ class SQLToMongoDBTranspiler:
     
     def _transpile_insert(self) -> Dict[str, Any]:
         """Transpile INSERT statement."""
-        raise UnsupportedSQLException("INSERT statement transpilation not yet implemented")
+        if not self.parser:
+            raise InvalidQueryException("Parser not initialized")
+        
+        table = self.parser.extract_insert_table()
+        columns, values = self.parser.extract_insert_values()
+        
+        # Create document dictionary
+        document = {}
+        for col, val in zip(columns, values):
+            document[col] = val
+        
+        return self.generator.generate_insert(
+            table=table,
+            document=document,
+        )
     
     def _transpile_update(self) -> Dict[str, Any]:
         """Transpile UPDATE statement."""
-        raise UnsupportedSQLException("UPDATE statement transpilation not yet implemented")
+        if not self.parser:
+            raise InvalidQueryException("Parser not initialized")
+        
+        table = self.parser.extract_update_table()
+        updates, where_clause = self.parser.extract_update_values()
+        
+        return self.generator.generate_update(
+            table=table,
+            updates=updates,
+            where_clause=where_clause,
+        )
     
     def _transpile_delete(self) -> Dict[str, Any]:
         """Transpile DELETE statement."""
-        raise UnsupportedSQLException("DELETE statement transpilation not yet implemented")
+        if not self.parser:
+            raise InvalidQueryException("Parser not initialized")
+        
+        table = self.parser.extract_from_clause()
+        where_clause = self.parser.extract_where_clause()
+        
+        return self.generator.generate_delete(
+            table=table,
+            where_clause=where_clause,
+        )
 
 
 # =====================================================================
@@ -672,6 +871,7 @@ class TestSuite:
         print("SQL-TO-MONGODB TRANSPILER TEST SUITE")
         print("="*70 + "\n")
         
+        # SELECT tests
         self.test_simple_select()
         self.test_select_with_where_single_condition()
         self.test_select_with_where_and_conditions()
@@ -682,6 +882,19 @@ class TestSuite:
         self.test_select_specific_columns()
         self.test_select_with_in_operator()
         self.test_select_with_comparison_operators()
+        
+        # INSERT tests
+        self.test_insert_basic()
+        
+        # UPDATE tests
+        self.test_update_basic()
+        self.test_update_multiple_fields()
+        
+        # DELETE tests
+        self.test_delete_basic()
+        self.test_delete_with_condition()
+        
+        # Error handling tests
         self.test_error_handling()
         
         self._print_summary()
@@ -882,6 +1095,94 @@ class TestSuite:
                     self._log_test(test_name, True, sql, f"Correctly raised {type(e).__name__}")
                 else:
                     self._log_test(test_name, False, sql, f"Expected {expected_exception} but got {type(e).__name__}: {str(e)}")
+    
+    def test_insert_basic(self) -> None:
+        """Test: Basic INSERT statement."""
+        test_name = "INSERT basic"
+        sql = "INSERT INTO users (name, email, age) VALUES ('John', 'john@example.com', 25)"
+        
+        try:
+            result = self.transpiler.transpile(sql)
+            
+            assert result["collection"] == "users_collection"
+            assert result["type"] == "insert"
+            assert "document" in result
+            assert result["document"]["user_name"] == "John"
+            assert result["document"]["user_email"] == "john@example.com"
+            assert result["document"]["user_age"] == 25
+            
+            self._log_test(test_name, True, sql, result)
+        except Exception as e:
+            self._log_test(test_name, False, sql, str(e))
+    
+    def test_update_basic(self) -> None:
+        """Test: Basic UPDATE statement."""
+        test_name = "UPDATE basic"
+        sql = "UPDATE users SET name = 'Jane' WHERE id = 1"
+        
+        try:
+            result = self.transpiler.transpile(sql)
+            
+            assert result["collection"] == "users_collection"
+            assert result["type"] == "update"
+            assert "update" in result
+            assert "$set" in result["update"]
+            assert result["update"]["$set"]["user_name"] == "Jane"
+            assert "_id" in result["filter"]
+            
+            self._log_test(test_name, True, sql, result)
+        except Exception as e:
+            self._log_test(test_name, False, sql, str(e))
+    
+    def test_update_multiple_fields(self) -> None:
+        """Test: UPDATE with multiple fields."""
+        test_name = "UPDATE multiple fields"
+        sql = "UPDATE users SET name = 'Jane', age = 30 WHERE email = 'jane@example.com'"
+        
+        try:
+            result = self.transpiler.transpile(sql)
+            
+            assert result["collection"] == "users_collection"
+            assert result["type"] == "update"
+            assert result["update"]["$set"]["user_name"] == "Jane"
+            assert result["update"]["$set"]["user_age"] == 30
+            
+            self._log_test(test_name, True, sql, result)
+        except Exception as e:
+            self._log_test(test_name, False, sql, str(e))
+    
+    def test_delete_basic(self) -> None:
+        """Test: Basic DELETE statement."""
+        test_name = "DELETE basic"
+        sql = "DELETE FROM users WHERE id = 1"
+        
+        try:
+            result = self.transpiler.transpile(sql)
+            
+            assert result["collection"] == "users_collection"
+            assert result["type"] == "delete"
+            assert "filter" in result
+            assert "_id" in result["filter"]
+            
+            self._log_test(test_name, True, sql, result)
+        except Exception as e:
+            self._log_test(test_name, False, sql, str(e))
+    
+    def test_delete_with_condition(self) -> None:
+        """Test: DELETE with complex WHERE condition."""
+        test_name = "DELETE with condition"
+        sql = "DELETE FROM users WHERE age > 50 AND status = 'inactive'"
+        
+        try:
+            result = self.transpiler.transpile(sql)
+            
+            assert result["collection"] == "users_collection"
+            assert result["type"] == "delete"
+            assert "filter" in result
+            
+            self._log_test(test_name, True, sql, result)
+        except Exception as e:
+            self._log_test(test_name, False, sql, str(e))
     
     def _log_test(self, test_name: str, passed: bool, sql: str, result: Any) -> None:
         """Log test result."""
