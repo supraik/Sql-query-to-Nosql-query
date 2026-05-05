@@ -2,3 +2,7 @@
 ./lec2Notes.pdf
 ./lec3Notes.pdf
 ./project_report.tex
+_pycache__/
+__pycache__/
+*.pyc
+COMPLETION_REPORT
